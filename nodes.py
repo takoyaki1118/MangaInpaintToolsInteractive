@@ -1,160 +1,141 @@
 # /ComfyUI/custom_nodes/MangaInpaintToolsInteractive/nodes.py
+#
+# 最終完成版: 連結判定を8方向から4方向に変更し、角で接触するコマを分離
+# 依存ライブラリ: opencv-python, numpy, torch
 
 import torch
 import numpy as np
 import cv2
 
-# --------------------------------------------------------------------
-# Node 1: MangaPanelDetectorAdvanced
-# Cannyエッジ検出を用いて、絵が描かれた画像からもコマを検出する高機能版
-# --------------------------------------------------------------------
-class MangaPanelDetectorAdvanced:
-    MAX_PANELS = 8
+# --- グローバル定数 ---
+MAX_PANELS = 16
 
+# --------------------------------------------------------------------
+# Node 1: MangaPanelDetector_Final (最終版)
+# --------------------------------------------------------------------
+class MangaPanelDetector_Final:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "image": ("IMAGE",),
-                "blur_sigma": ("INT", {"default": 5, "min": 1, "max": 15, "step": 2}),
-                "canny_low_threshold": ("INT", {"default": 50, "min": 0, "max": 255}),
-                "canny_high_threshold": ("INT", {"default": 150, "min": 0, "max": 255}),
+                "frame_color_hex": ("STRING", {"default": "#FFFFFF"}),
+                "color_tolerance": ("INT", {"default": 25, "min": 0, "max": 255}),
+                "noise_removal_scale": ("INT", {"default": 15, "min": 1, "max": 100}),
+                "line_rebuild_thickness": ("INT", {"default": 5, "min": 1, "max": 50}),
                 "sort_panels_by": (["top-to-bottom", "left-to-right", "largest-first"],),
                 "min_area": ("INT", {"default": 5000, "min": 0, "max": 999999}),
             }
         }
 
-    RETURN_TYPES = ("MASK", "INT")
-    RETURN_NAMES = ("mask_batch", "panel_count")
+    RETURN_TYPES = ("MASK", "INT", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("mask_batch", "panel_count", "DEBUG_color_mask", "DEBUG_cleaned_frame")
     FUNCTION, CATEGORY = "detect_panels", "Manga Inpaint"
 
-    def detect_panels(self, image, blur_sigma, canny_low_threshold, canny_high_threshold, sort_panels_by, min_area):
-        base_image_tensor = image[0].unsqueeze(0)
-        img_h, img_w = base_image_tensor.shape[1], base_image_tensor.shape[2]
-        base_img_cv2 = (base_image_tensor.cpu().numpy().squeeze(0) * 255).astype(np.uint8)
+    def hex_to_rgb(self, h):
+        h = h.lstrip('#')
+        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
-        # 1. グレースケール変換とぼかし（ノイズ除去）
-        gray = cv2.cvtColor(base_img_cv2, cv2.COLOR_RGB2GRAY)
-        blurred = cv2.GaussianBlur(gray, (blur_sigma, blur_sigma), 0)
-
-        # 2. Cannyエッジ検出で枠線を抽出
-        edges = cv2.Canny(blurred, canny_low_threshold, canny_high_threshold)
-
-        # 3. 検出されたエッジから輪郭を見つける
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def detect_panels(self, image, frame_color_hex, color_tolerance, 
+                      noise_removal_scale, line_rebuild_thickness, sort_panels_by, min_area):
         
-        if not contours:
-            return (torch.zeros((1, img_h, img_w), device=image.device), 0)
+        base_image_tensor = image[0]
+        img_h, img_w = base_image_tensor.shape[0], base_image_tensor.shape[1]
+        base_img_cv2 = (base_image_tensor.cpu().numpy() * 255).astype(np.uint8)
+
+        # Step 1: 手動指定された色でマスクを作成
+        rgb_tuple = self.hex_to_rgb(frame_color_hex)
+        frame_color = np.array(rgb_tuple)
+        lower = np.maximum(0, frame_color - color_tolerance).astype(np.uint8)
+        upper = np.minimum(255, frame_color + color_tolerance).astype(np.uint8)
+        color_mask = cv2.inRange(base_img_cv2, lower, upper)
+        color_mask_debug = torch.from_numpy(cv2.cvtColor(color_mask, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0).unsqueeze(0).to(image.device)
+
+        # Step 2: 形態論的変換でノイズ（絵柄）を除去
+        kernel = np.ones((noise_removal_scale, noise_removal_scale), np.uint8)
+        cleaned_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+        rebuild_kernel = np.ones((line_rebuild_thickness, line_rebuild_thickness), np.uint8)
+        cleaned_mask = cv2.dilate(cleaned_mask, rebuild_kernel, iterations=1)
+        cleaned_frame_debug = torch.from_numpy(cv2.cvtColor(cleaned_mask, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0).unsqueeze(0).to(image.device)
         
-        # 輪郭とメタデータ（バウンディングボックス、面積）をリスト化
-        contours_with_meta = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area > min_area: # 小さすぎる領域をここで除外
-                x, y, w, h = cv2.boundingRect(c)
-                contours_with_meta.append({'contour': c, 'box': (x, y, w, h), 'area': area})
+        # Step 3: クリーンなマスクからコマ領域を判定
+        inverted_mask = cv2.bitwise_not(cleaned_mask)
+        
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        # ★★★ 修正点: 連結方法を8方向から4方向(4)に変更 ★★★
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(inverted_mask, 4, cv2.CV_32S)
 
-        # ソート
-        if sort_panels_by == "largest-first":
-            contours_with_meta.sort(key=lambda item: item['area'], reverse=True)
-        elif sort_panels_by == "top-to-bottom":
-            contours_with_meta.sort(key=lambda item: (item['box'][1], item['box'][0]))
-        else: # left-to-right
-            contours_with_meta.sort(key=lambda item: (item['box'][0], item['box'][1]))
+        panels_meta = []
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area > min_area:
+                x = stats[i, cv2.CC_STAT_LEFT]
+                y = stats[i, cv2.CC_STAT_TOP]
+                panels_meta.append({'label_index': i, 'box': (x, y), 'area': area})
+        
+        if not panels_meta:
+            return (torch.zeros((1, img_h, img_w), device=image.device), 0, color_mask_debug, cleaned_frame_debug)
 
-        # マスクを生成
+        # Step 4: 検出したパネルをソート
+        if sort_panels_by == "largest-first": panels_meta.sort(key=lambda item: item['area'], reverse=True)
+        elif sort_panels_by == "top-to-bottom": panels_meta.sort(key=lambda item: (item['box'][1], item['box'][0]))
+        else: panels_meta.sort(key=lambda item: (item['box'][0], item['box'][1]))
+
+        # Step 5: 最終的なマスクを生成
         mask_list = []
-        num_detected = min(len(contours_with_meta), self.MAX_PANELS)
-        for i in range(num_detected):
-            contour = contours_with_meta[i]['contour']
-            mask_np = np.zeros((img_h, img_w), dtype=np.uint8)
-            # 輪郭の内側を塗りつぶしてマスクを作成
-            cv2.drawContours(mask_np, [contour], -1, 255, thickness=cv2.FILLED)
-            mask_tensor = torch.from_numpy(mask_np).to(image.device, dtype=torch.float32) / 255.0
-            mask_list.append(mask_tensor.unsqueeze(0))
+        for item in panels_meta[:MAX_PANELS]:
+            mask_np = np.where(labels == item['label_index'], 255, 0).astype(np.uint8)
+            mask_list.append((torch.from_numpy(mask_np).to(image.device, dtype=torch.float32) / 255.0).unsqueeze(0))
 
         if not mask_list:
-            return (torch.zeros((1, img_h, img_w), device=image.device), 0)
+            return (torch.zeros((1, img_h, img_w), device=image.device), 0, color_mask_debug, cleaned_frame_debug)
             
-        return (torch.cat(mask_list, dim=0), len(mask_list))
+        return (torch.cat(mask_list, dim=0), len(mask_list), color_mask_debug, cleaned_frame_debug)
 
 # --------------------------------------------------------------------
-# Node 2: CropPanelForInpaint (変更なし)
+# Node 2 & 3 (CropPanelForInpaint_Advanced, AssembleSinglePanel - 変更なし)
 # --------------------------------------------------------------------
-class CropPanelForInpaint:
+class CropPanelForInpaint_Advanced:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "mask_batch": ("MASK",),
-                "panel_index": ("INT", {"default": 1, "min": 1, "max": MangaPanelDetectorAdvanced.MAX_PANELS}),
-            }
-        }
-    RETURN_TYPES = ("IMAGE", "MASK")
+        return { "required": { "image": ("IMAGE",), "mask_batch": ("MASK",), "panel_index": ("INT", {"default": 1, "min": 1, "max": MAX_PANELS}), "fill_color_hex": ("STRING", {"default": "#000000"}), }}
+    RETURN_TYPES, FUNCTION, CATEGORY = ("IMAGE", "MASK"), "crop", "Manga Inpaint"
     RETURN_NAMES = ("cropped_panel", "cropped_mask")
-    FUNCTION, CATEGORY = "crop", "Manga Inpaint"
-
-    def crop(self, image, mask_batch, panel_index):
+    def hex_to_rgb(self, h): h = h.lstrip('#'); return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+    def crop(self, image, mask_batch, panel_index, fill_color_hex):
         index = panel_index - 1
-        if image.shape[0] == 0 or mask_batch.shape[0] == 0 or index < 0 or index >= mask_batch.shape[0]:
-            dummy_img = torch.zeros((1, 64, 64, 3), dtype=torch.float32, device=image.device)
-            dummy_mask = torch.zeros((1, 64, 64), dtype=torch.float32, device=image.device)
-            return (dummy_img, dummy_mask)
-        image_tensor = image[0]; mask = mask_batch[index]
+        if image.shape[0] == 0 or mask_batch.shape[0] == 0 or index < 0 or index >= mask_batch.shape[0]: return (torch.zeros((1, 64, 64, 3)), torch.zeros((1, 64, 64)))
+        image_tensor, mask = image[0], mask_batch[index]
         coords = torch.nonzero(mask, as_tuple=False)
-        if coords.shape[0] == 0:
-            dummy_img = torch.zeros((1, 64, 64, 3), dtype=torch.float32, device=image.device)
-            dummy_mask = torch.zeros((1, 64, 64), dtype=torch.float32, device=image.device)
-            return (dummy_img, dummy_mask)
-        y_coords, x_coords = coords[:, 0], coords[:, 1]
-        y1, y2, x1, x2 = y_coords.min(), y_coords.max(), x_coords.min(), x_coords.max()
-        cropped_image = image_tensor[y1:y2+1, x1:x2+1, :]
-        cropped_mask = mask[y1:y2+1, x1:x2+1]
-        return (cropped_image.unsqueeze(0), cropped_mask.unsqueeze(0))
+        if coords.shape[0] == 0: return (torch.zeros((1, 64, 64, 3)), torch.zeros((1, 64, 64)))
+        fill_rgb = self.hex_to_rgb(fill_color_hex)
+        fill_color_tensor = torch.tensor([c / 255.0 for c in fill_rgb], device=image.device, dtype=torch.float32)
+        expanded_mask = mask.unsqueeze(-1)
+        masked_full_image = torch.where(expanded_mask > 0.5, image_tensor, fill_color_tensor)
+        y1, y2, x1, x2 = coords[:, 0].min(), coords[:, 0].max(), coords[:, 1].min(), coords[:, 1].max()
+        return (masked_full_image[y1:y2+1, x1:x2+1, :].unsqueeze(0), mask[y1:y2+1, x1:x2+1].unsqueeze(0))
 
-# --------------------------------------------------------------------
-# Node 3: AssembleSinglePanel
-# 生成された1枚の画像を、指定されたインデックスの場所に合成するノード
-# --------------------------------------------------------------------
 class AssembleSinglePanel:
     @classmethod
     def INPUT_TYPES(s):
-        return {
-            "required": {
-                "base_image": ("IMAGE",),
-                "generated_panel": ("IMAGE",),
-                "mask_batch": ("MASK",),
-                "panel_index": ("INT", {"default": 1, "min": 1, "max": MangaPanelDetectorAdvanced.MAX_PANELS}),
-            }
-        }
+        return { "required": { "base_image": ("IMAGE",), "generated_panel": ("IMAGE",), "mask_batch": ("MASK",), "panel_index": ("INT", {"default": 1, "min": 1, "max": MAX_PANELS}), }}
     RETURN_TYPES, FUNCTION, CATEGORY = ("IMAGE",), "assemble", "Manga Inpaint"
-    
     def assemble(self, base_image, generated_panel, mask_batch, panel_index):
         canvas_tensor = base_image[0].clone()
         index = panel_index - 1
-        
-        if generated_panel.shape[0] == 0 or mask_batch.shape[0] == 0 or index < 0 or index >= mask_batch.shape[0]:
-            return (base_image,) # 何もせず元の画像を返す
-
-        image_to_paste = generated_panel[0]
-        mask = mask_batch[index]
-        
+        if generated_panel.shape[0] == 0 or mask_batch.shape[0] == 0 or index < 0 or index >= mask_batch.shape[0]: return (base_image,)
+        image_to_paste, mask = generated_panel[0], mask_batch[index]
         coords = torch.nonzero(mask, as_tuple=False)
         if coords.shape[0] == 0: return (base_image,)
-        
-        y_coords, x_coords = coords[:, 0], coords[:, 1]
-        y1, y2, x1, x2 = y_coords.min(), y_coords.max(), x_coords.min(), x_coords.max()
+        y1, y2, x1, x2 = coords[:, 0].min(), coords[:, 0].max(), coords[:, 1].min(), coords[:, 1].max()
         h, w = y2 - y1 + 1, x2 - x1 + 1
         if h <= 0 or w <= 0: return (base_image,)
-
-        img_to_resize_chw = image_to_paste.permute(2, 0, 1).unsqueeze(0)
-        resized_chw = torch.nn.functional.interpolate(img_to_resize_chw, size=(h.item(), w.item()), mode='bilinear', align_corners=False)
+        img_chw = image_to_paste.permute(2, 0, 1).unsqueeze(0)
+        resized_chw = torch.nn.functional.interpolate(img_chw, size=(h.item(), w.item()), mode='bilinear', align_corners=False)
         resized_image = resized_chw.squeeze(0).permute(1, 2, 0)
-        
         target_region = canvas_tensor[y1:y2+1, x1:x2+1]
         sub_mask = mask[y1:y2+1, x1:x2+1].unsqueeze(-1)
         pasted_region = torch.where(sub_mask > 0.5, resized_image, target_region)
         canvas_tensor[y1:y2+1, x1:x2+1] = pasted_region
-            
         return (canvas_tensor.unsqueeze(0),)
