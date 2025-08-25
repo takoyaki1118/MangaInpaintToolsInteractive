@@ -1,6 +1,6 @@
 # /ComfyUI/custom_nodes/MangaInpaintToolsInteractive/nodes.py
 #
-# 最終完成版: 連結判定を8方向から4方向に変更し、角で接触するコマを分離
+# 真の最終完成版: ノイズ除去処理をMORPH_CLOSEに刷新し、パラメータの挙動を直感的に
 # 依存ライブラリ: opencv-python, numpy, torch
 
 import torch
@@ -11,18 +11,18 @@ import cv2
 MAX_PANELS = 16
 
 # --------------------------------------------------------------------
-# Node 1: MangaPanelDetector_Final (最終版)
+# Node 1: MangaPanelDetector_Ultimate (真の最終版)
 # --------------------------------------------------------------------
-class MangaPanelDetector_Final:
+class MangaPanelDetector_Ultimate:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "image": ("IMAGE",),
                 "frame_color_hex": ("STRING", {"default": "#FFFFFF"}),
-                "color_tolerance": ("INT", {"default": 25, "min": 0, "max": 255}),
-                "noise_removal_scale": ("INT", {"default": 15, "min": 1, "max": 100}),
-                "line_rebuild_thickness": ("INT", {"default": 5, "min": 1, "max": 50}),
+                "color_tolerance": ("INT", {"default": 10, "min": 0, "max": 255}),
+                "gap_closing_scale": ("INT", {"default": 5, "min": 1, "max": 100}), # ★ パラメータ名を変更
+                "final_line_thickness": ("INT", {"default": 5, "min": 1, "max": 50}),# ★ パラメータ名を変更
                 "sort_panels_by": (["top-to-bottom", "left-to-right", "largest-first"],),
                 "min_area": ("INT", {"default": 5000, "min": 0, "max": 999999}),
             }
@@ -32,12 +32,10 @@ class MangaPanelDetector_Final:
     RETURN_NAMES = ("mask_batch", "panel_count", "DEBUG_color_mask", "DEBUG_cleaned_frame")
     FUNCTION, CATEGORY = "detect_panels", "Manga Inpaint"
 
-    def hex_to_rgb(self, h):
-        h = h.lstrip('#')
-        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+    def hex_to_rgb(self, h): h = h.lstrip('#'); return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
     def detect_panels(self, image, frame_color_hex, color_tolerance, 
-                      noise_removal_scale, line_rebuild_thickness, sort_panels_by, min_area):
+                      gap_closing_scale, final_line_thickness, sort_panels_by, min_area):
         
         base_image_tensor = image[0]
         img_h, img_w = base_image_tensor.shape[0], base_image_tensor.shape[1]
@@ -51,50 +49,44 @@ class MangaPanelDetector_Final:
         color_mask = cv2.inRange(base_img_cv2, lower, upper)
         color_mask_debug = torch.from_numpy(cv2.cvtColor(color_mask, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0).unsqueeze(0).to(image.device)
 
-        # Step 2: 形態論的変換でノイズ（絵柄）を除去
-        kernel = np.ones((noise_removal_scale, noise_removal_scale), np.uint8)
-        cleaned_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
-        rebuild_kernel = np.ones((line_rebuild_thickness, line_rebuild_thickness), np.uint8)
-        cleaned_mask = cv2.dilate(cleaned_mask, rebuild_kernel, iterations=1)
-        cleaned_frame_debug = torch.from_numpy(cv2.cvtColor(cleaned_mask, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0).unsqueeze(0).to(image.device)
+        # ★★★ 修正点: 処理をMORPH_CLOSEに変更 ★★★
+        # Step 2: 枠線の隙間を埋める
+        kernel_close = np.ones((gap_closing_scale, gap_closing_scale), np.uint8)
+        closed_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel_close)
+
+        # Step 3: 最終的な枠線の太さを確保
+        kernel_dilate = np.ones((final_line_thickness, final_line_thickness), np.uint8)
+        final_frame_mask = cv2.dilate(closed_mask, kernel_dilate, iterations=1)
+        cleaned_frame_debug = torch.from_numpy(cv2.cvtColor(final_frame_mask, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0).unsqueeze(0).to(image.device)
         
-        # Step 3: クリーンなマスクからコマ領域を判定
-        inverted_mask = cv2.bitwise_not(cleaned_mask)
-        
-        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-        # ★★★ 修正点: 連結方法を8方向から4方向(4)に変更 ★★★
-        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+        # Step 4: 連結成分ラベリングでコマ領域を判定 (4方向連結)
+        inverted_mask = cv2.bitwise_not(final_frame_mask)
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(inverted_mask, 4, cv2.CV_32S)
 
         panels_meta = []
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
-            if area > min_area:
-                x = stats[i, cv2.CC_STAT_LEFT]
-                y = stats[i, cv2.CC_STAT_TOP]
-                panels_meta.append({'label_index': i, 'box': (x, y), 'area': area})
+            if area > min_area: panels_meta.append({'label_index': i, 'box': (stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP]), 'area': area})
         
-        if not panels_meta:
-            return (torch.zeros((1, img_h, img_w), device=image.device), 0, color_mask_debug, cleaned_frame_debug)
+        if not panels_meta: return (torch.zeros((1, img_h, img_w), device=image.device), 0, color_mask_debug, cleaned_frame_debug)
 
-        # Step 4: 検出したパネルをソート
+        # Step 5: 検出したパネルをソート
         if sort_panels_by == "largest-first": panels_meta.sort(key=lambda item: item['area'], reverse=True)
         elif sort_panels_by == "top-to-bottom": panels_meta.sort(key=lambda item: (item['box'][1], item['box'][0]))
         else: panels_meta.sort(key=lambda item: (item['box'][0], item['box'][1]))
 
-        # Step 5: 最終的なマスクを生成
+        # Step 6: 最終的なマスクを生成
         mask_list = []
         for item in panels_meta[:MAX_PANELS]:
             mask_np = np.where(labels == item['label_index'], 255, 0).astype(np.uint8)
             mask_list.append((torch.from_numpy(mask_np).to(image.device, dtype=torch.float32) / 255.0).unsqueeze(0))
 
-        if not mask_list:
-            return (torch.zeros((1, img_h, img_w), device=image.device), 0, color_mask_debug, cleaned_frame_debug)
+        if not mask_list: return (torch.zeros((1, img_h, img_w), device=image.device), 0, color_mask_debug, cleaned_frame_debug)
             
         return (torch.cat(mask_list, dim=0), len(mask_list), color_mask_debug, cleaned_frame_debug)
 
 # --------------------------------------------------------------------
-# Node 2 & 3 (CropPanelForInpaint_Advanced, AssembleSinglePanel - 変更なし)
+# Node 2 & 3 (変更なし)
 # --------------------------------------------------------------------
 class CropPanelForInpaint_Advanced:
     @classmethod
