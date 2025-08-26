@@ -7,6 +7,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import cv2
+import json
+
 
 # --- グローバル定数 ---
 MAX_PANELS = 16
@@ -147,3 +149,67 @@ class AssembleSinglePanel:
         pasted_region = torch.where(sub_mask > 0.5, resized_image, target_region)
         canvas_tensor[y1:y2+1, x1:x2+1] = pasted_region
         return (canvas_tensor.unsqueeze(0),)
+
+# --------------------------------------------------------------------
+# ★★★ Node 0: InteractivePanelCreator (新規追加) ★★★
+# VisualRegionalPrompterのUIを利用してインタラクティブにパネルを作成するノード
+# --------------------------------------------------------------------
+class InteractivePanelCreator:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "width": ("INT", {"default": 768, "min": 64, "max": 8192, "step": 8}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
+                "sort_panels_by": (["drawing-order", "top-to-bottom", "left-to-right"],),
+                # JSからのデータを受け取るための隠しウィジェット
+                "regions_json": ("STRING", {"multiline": True, "default": "[]", "widget": "hidden"}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK", "INT")
+    RETURN_NAMES = ("mask_batch", "panel_count")
+    FUNCTION = "create_panels"
+    CATEGORY = "Manga Inpaint"
+
+    def create_panels(self, width, height, regions_json, sort_panels_by):
+        try:
+            regions = json.loads(regions_json)
+        except json.JSONDecodeError:
+            print("InteractivePanelCreator: Invalid JSON data. Returning empty mask.")
+            regions = []
+
+        if not regions:
+            # 空でもエラーにならないように、ダミーのテンソルを返す
+            return (torch.zeros((1, height, width), dtype=torch.float32), 0)
+
+        # ユーザーの選択に応じてパネル（領域）をソート
+        if sort_panels_by == "top-to-bottom":
+            regions.sort(key=lambda r: (r.get('y', 0), r.get('x', 0)))
+        elif sort_panels_by == "left-to-right":
+            regions.sort(key=lambda r: (r.get('x', 0), r.get('y', 0)))
+        # "drawing-order" は何もしない（元のリストの順序を維持）
+
+        mask_list = []
+        for region in regions:
+            x = int(region.get("x", 0))
+            y = int(region.get("y", 0))
+            w = int(region.get("w", 0))
+            h = int(region.get("h", 0))
+
+            if w <= 0 or h <= 0:
+                continue
+
+            # 新しいマスクを生成 (H, W)
+            mask = torch.zeros((height, width), dtype=torch.float32)
+            # 矩形領域を1.0で塗りつぶす
+            mask[y:y+h, x:x+w] = 1.0
+            mask_list.append(mask)
+
+        if not mask_list:
+            return (torch.zeros((1, height, width), dtype=torch.float32), 0)
+        
+        # マスクのリストを一つのテンソルにスタックしてバッチを作成 (Batch, H, W)
+        mask_batch = torch.stack(mask_list, dim=0)
+        
+        return (mask_batch, len(mask_list))
