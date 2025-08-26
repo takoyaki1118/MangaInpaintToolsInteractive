@@ -25,12 +25,15 @@ NODE_CLASS_MAPPINGS = {
     "AssembleSinglePanel": AssembleSinglePanel,
 }
 
+# /ComfyUI/custom_nodes/MangaInpaintToolsInteractive/__init__.py の
+# NODE_DISPLAY_NAME_MAPPINGS を以下のように書き換える
+
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MangaPanelDetector_Ultimate": "① Detect Panels by Color (Ultimate)",
-    "InteractivePanelCreator": "① Create Panels Interactively", # ★ 表示名を追加
-    "CropPanelForInpaint_Advanced": "② Crop Panel (Shape Aware)",
-    "ConditionalLatentScaler_Final": "③ Conditionally Scale Latent",
-    "AssembleSinglePanel": "④ Assemble Single Panel",
+    "MangaPanelDetector_Ultimate": "② Detect Panels by Color (Ultimate)",
+    "InteractivePanelCreator": "① Create Panel Layout Image", # ← 表示名を変更
+    "CropPanelForInpaint_Advanced": "③ Crop Panel (Shape Aware)",
+    "ConditionalLatentScaler_Final": "④ Conditionally Scale Latent",
+    "AssembleSinglePanel": "⑤ Assemble Single Panel",
 }
 
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']

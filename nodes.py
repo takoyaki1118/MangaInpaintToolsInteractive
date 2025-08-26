@@ -151,8 +151,8 @@ class AssembleSinglePanel:
         return (canvas_tensor.unsqueeze(0),)
 
 # --------------------------------------------------------------------
-# ★★★ Node 0: InteractivePanelCreator (新規追加) ★★★
-# VisualRegionalPrompterのUIを利用してインタラクティブにパネルを作成するノード
+# ★★★ Node 0: InteractivePanelCreator (改訂版) ★★★
+# UIで描画したコマ割りのレイアウト画像を生成するノード
 # --------------------------------------------------------------------
 class InteractivePanelCreator:
     @classmethod
@@ -161,55 +161,48 @@ class InteractivePanelCreator:
             "required": {
                 "width": ("INT", {"default": 768, "min": 64, "max": 8192, "step": 8}),
                 "height": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
-                "sort_panels_by": (["drawing-order", "top-to-bottom", "left-to-right"],),
                 # JSからのデータを受け取るための隠しウィジェット
                 "regions_json": ("STRING", {"multiline": True, "default": "[]", "widget": "hidden"}),
             }
         }
 
-    RETURN_TYPES = ("MASK", "INT")
-    RETURN_NAMES = ("mask_batch", "panel_count")
-    FUNCTION = "create_panels"
+    # 戻り値の型をIMAGEに変更
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "create_layout_image"
     CATEGORY = "Manga Inpaint"
 
-    def create_panels(self, width, height, regions_json, sort_panels_by):
+    def create_layout_image(self, width, height, regions_json):
         try:
             regions = json.loads(regions_json)
         except json.JSONDecodeError:
-            print("InteractivePanelCreator: Invalid JSON data. Returning empty mask.")
+            print("InteractivePanelCreator: Invalid JSON data. Returning empty image.")
             regions = []
 
-        if not regions:
-            # 空でもエラーにならないように、ダミーのテンソルを返す
-            return (torch.zeros((1, height, width), dtype=torch.float32), 0)
+        # 黒いキャンバスを作成 (H, W)
+        canvas = torch.zeros((height, width), dtype=torch.float32)
 
-        # ユーザーの選択に応じてパネル（領域）をソート
-        if sort_panels_by == "top-to-bottom":
-            regions.sort(key=lambda r: (r.get('y', 0), r.get('x', 0)))
-        elif sort_panels_by == "left-to-right":
-            regions.sort(key=lambda r: (r.get('x', 0), r.get('y', 0)))
-        # "drawing-order" は何もしない（元のリストの順序を維持）
+        if regions:
+            # 各領域をループしてキャンバスに白で描画
+            for region in regions:
+                x = int(region.get("x", 0))
+                y = int(region.get("y", 0))
+                w = int(region.get("w", 0))
+                h = int(region.get("h", 0))
 
-        mask_list = []
-        for region in regions:
-            x = int(region.get("x", 0))
-            y = int(region.get("y", 0))
-            w = int(region.get("w", 0))
-            h = int(region.get("h", 0))
+                if w <= 0 or h <= 0:
+                    continue
+                
+                # 矩形領域を白(1.0)で塗りつぶす
+                # 座標が画像の範囲を超えないようにクリッピング
+                x_end = min(x + w, width)
+                y_end = min(y + h, height)
+                canvas[y:y_end, x:x_end] = 1.0
 
-            if w <= 0 or h <= 0:
-                continue
+        # ComfyUIのIMAGE形式 (Batch, H, W, Channels) に変換
+        # チャンネル次元を追加し、3チャンネルに複製 (R, G, Bがすべて同じ値のグレースケール画像になる)
+        image_rgb = canvas.unsqueeze(-1).repeat(1, 1, 3)
+        # バッチ次元を追加
+        image_batch = image_rgb.unsqueeze(0)
 
-            # 新しいマスクを生成 (H, W)
-            mask = torch.zeros((height, width), dtype=torch.float32)
-            # 矩形領域を1.0で塗りつぶす
-            mask[y:y+h, x:x+w] = 1.0
-            mask_list.append(mask)
-
-        if not mask_list:
-            return (torch.zeros((1, height, width), dtype=torch.float32), 0)
-        
-        # マスクのリストを一つのテンソルにスタックしてバッチを作成 (Batch, H, W)
-        mask_batch = torch.stack(mask_list, dim=0)
-        
-        return (mask_batch, len(mask_list))
+        return (image_batch,)
